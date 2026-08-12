@@ -15,8 +15,14 @@ import os
 import re
 import sys
 import socket
+import json
+import time
+import shlex
+import signal
+import threading
 import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 R    = "\033[91m"
@@ -48,7 +54,32 @@ WORDLIST_PATHS = [
     "/usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt",
 ]
 
-results = []  # Global results store
+results = []            # Global results store
+_results_lock = threading.Lock()
+
+# ── Run configuration (populated in main, read everywhere) ─────────────────────
+class Config:
+    verbose       = False   # dump raw command output to the console
+    timeout_scale = 1.0     # multiply every command timeout (slow/large envs)
+    loot_dir      = "/tmp"  # where harvested hashes / temp files are written
+    jobs          = 1       # worker threads (1 == old sequential streaming)
+    commands_run  = 0       # cheap telemetry for the report
+
+CFG = Config()
+
+# Per-thread console buffer. When running concurrently, each check writes its
+# console output into its own buffer and we flush it atomically at the end, so
+# parallel checks don't interleave into unreadable soup. In sequential mode the
+# buffer is None and output streams live, exactly like before.
+_tls = threading.local()
+
+def _emit(line):
+    """Send a line to the active per-thread buffer, or straight to stdout."""
+    buf = getattr(_tls, "buffer", None)
+    if buf is None:
+        print(line)
+    else:
+        buf.append(line)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -58,6 +89,10 @@ def banner():
 
 
 def log(msg, level="info"):
+    # Raw "info" dumps (the noisy "Raw output:\n..." lines) are gated behind
+    # --verbose so a normal run stays readable. Findings still always show.
+    if level == "info" and msg.lstrip().startswith("Raw output") and not CFG.verbose:
+        return
     ts = datetime.datetime.now().strftime("%H:%M:%S")
     icons = {
         "info": f"{B}[*]{RST}",
@@ -65,25 +100,36 @@ def log(msg, level="info"):
         "bad":  f"{R}[-]{RST}",
         "warn": f"{Y}[!]{RST}",
     }
-    print(f"  {icons.get(level, '[*]')} [{ts}] {msg}")
+    _emit(f"  {icons.get(level, '[*]')} [{ts}] {msg}")
 
 
 def section(title):
-    print(f"\n{BOLD}{C}{'─'*60}{RST}")
-    print(f"{BOLD}{C}  {title}{RST}")
-    print(f"{BOLD}{C}{'─'*60}{RST}")
+    _emit(f"\n{BOLD}{C}{'─'*60}{RST}")
+    _emit(f"{BOLD}{C}  {title}{RST}")
+    _emit(f"{BOLD}{C}{'─'*60}{RST}")
 
 
 def run(cmd, timeout=30):
-    """Run a shell command, return stdout+stderr."""
+    """Run a command and return stdout+stderr.
+
+    `cmd` may be a string (executed via the shell, as before) or a list of
+    argv tokens (executed without a shell — safer for interpolated values).
+    All timeouts are multiplied by CFG.timeout_scale so slow/large estates
+    can be accommodated with a single flag instead of editing the source.
+    """
+    CFG.commands_run += 1
+    eff_timeout = max(1, int(timeout * CFG.timeout_scale))
+    use_shell = isinstance(cmd, str)
     try:
         proc = subprocess.run(
-            cmd, shell=True, capture_output=True,
-            text=True, timeout=timeout
+            cmd, shell=use_shell, capture_output=True,
+            text=True, timeout=eff_timeout
         )
         return proc.stdout + proc.stderr
     except subprocess.TimeoutExpired:
         return "TIMEOUT"
+    except FileNotFoundError:
+        return "ERROR: command not found"
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -133,12 +179,29 @@ def certipy_cred(username, domain, password, nt_hash=""):
 
 
 def store(check, status, evidence, recommendation=""):
-    results.append({
-        "check": check,
-        "status": status,
-        "evidence": evidence,
-        "recommendation": recommendation,
-    })
+    with _results_lock:
+        results.append({
+            "check": check,
+            "status": status,
+            "evidence": evidence,
+            "recommendation": recommendation,
+        })
+
+
+def loot_path(name):
+    """Resolve a loot/temp filename inside the per-run loot dir (0700).
+
+    Replaces the old world-readable, collision-prone hardcoded /tmp paths so
+    harvested hashes and candidate lists aren't left readable by every user
+    on a shared testing box.
+    """
+    d = Path(CFG.loot_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except Exception:
+        pass
+    return str(d / name)
 
 
 # ── Checks ────────────────────────────────────────────────────────────────────
@@ -383,13 +446,14 @@ def check_adcs(dc_ip, username, password, domain, nh=""):
 def check_kerberoast(dc_ip, username, password, domain, nh=""):
     section("12. Kerberoasting")
     log("Checking for Kerberoastable accounts...")
+    kfile = loot_path("kerberoast.txt")
     out = run(
-        f"nxc ldap {dc_ip} {nxc_cred(username, password, nh)} -d '{domain}' --kerberoasting /tmp/kerberoast.txt",
+        f"nxc ldap {dc_ip} {nxc_cred(username, password, nh)} -d '{domain}' --kerberoasting {shlex.quote(kfile)}",
         timeout=60,
     )
     log(f"Raw output:\n{out}", "info")
-    if "$krb5tgs$" in out or os.path.exists("/tmp/kerberoast.txt"):
-        hashes = open("/tmp/kerberoast.txt").read() if os.path.exists("/tmp/kerberoast.txt") else ""
+    if "$krb5tgs$" in out or os.path.exists(kfile):
+        hashes = open(kfile).read() if os.path.exists(kfile) else ""
         count = hashes.count("$krb5tgs$")
         log(f"Kerberoastable accounts found: {count}", "good")
         store("Kerberoasting", f"VULNERABLE — {count} account(s)",
@@ -404,13 +468,14 @@ def check_kerberoast(dc_ip, username, password, domain, nh=""):
 def check_asreproast(dc_ip, username, password, domain, nh=""):
     section("13. AS-REP Roasting")
     log("Checking for AS-REP Roastable accounts...")
+    afile = loot_path("asrep.txt")
     out = run(
-        f"nxc ldap {dc_ip} {nxc_cred(username, password, nh)} -d '{domain}' --asreproast /tmp/asrep.txt",
+        f"nxc ldap {dc_ip} {nxc_cred(username, password, nh)} -d '{domain}' --asreproast {shlex.quote(afile)}",
         timeout=60,
     )
     log(f"Raw output:\n{out}", "info")
-    if "$krb5asrep$" in out or os.path.exists("/tmp/asrep.txt"):
-        hashes = open("/tmp/asrep.txt").read() if os.path.exists("/tmp/asrep.txt") else ""
+    if "$krb5asrep$" in out or os.path.exists(afile):
+        hashes = open(afile).read() if os.path.exists(afile) else ""
         count = hashes.count("$krb5asrep$")
         log(f"AS-REP Roastable accounts found: {count}", "good")
         store("AS-REP Roasting", f"VULNERABLE — {count} account(s)",
@@ -867,7 +932,7 @@ def check_password_spray(dc_ip, username, password, domain, nh=""):
         f"Spring{year-1}!", f"Summer{year-1}!", f"Autumn{year-1}!", f"Winter{year-1}!",
         "Password1!", "Password123!", "Welcome1!",
     ]
-    spray_list = "/tmp/spray_candidates.txt"
+    spray_list = loot_path("spray_candidates.txt")
     Path(spray_list).write_text("\n".join(candidates))
 
     # Enumerate users first
@@ -875,7 +940,7 @@ def check_password_spray(dc_ip, username, password, domain, nh=""):
         f"nxc ldap {dc_ip} {nxc_cred(username, password, nh)} -d '{domain}' --users",
         timeout=60,
     )
-    user_list = "/tmp/spray_users.txt"
+    user_list = loot_path("spray_users.txt")
     users = re.findall(r"\s+([\w\.\-]+)\s+\d{4}-\d{2}-\d{2}", out_users)
     if not users:
         store("Password Spray", "SKIPPED — user enum failed", out_users.strip())
@@ -915,7 +980,7 @@ def check_user_equals_password(dc_ip, username, password, domain, nh=""):
         store("User = Password", "SKIPPED — user enum failed", out_users.strip())
         return
 
-    user_list = "/tmp/ueqp_users.txt"
+    user_list = loot_path("ueqp_users.txt")
     Path(user_list).write_text("\n".join(users[:200]))
     log(f"Testing {len(users[:200])} users...")
     out = run(
@@ -2169,25 +2234,60 @@ CATEGORY_MAP = {
 }
 
 
+def severity(status):
+    """Classify a free-text status into vuln / safe / unknown.
+
+    Ordered by precedence so tricky phrasings land correctly:
+      - 'VULNERABLE — Not required'  → vuln  (lead token wins over trailing NOT)
+      - 'DISABLED — NLA not enforced' → vuln  (NOT ENFORCED beats bare DISABLED)
+      - 'LSA Protection (PPL): ENABLED' → safe (enabled is *good* here)
+      - 'Port open but auth required' → safe  (present but locked down)
+    """
+    s = status.upper().strip()
+
+    # 1. Not-run / indeterminate
+    if any(m in s for m in ("SKIPPED", "TIMEOUT", "ERROR", "INCONCLUSIVE")):
+        return "unknown"
+    if s.startswith(("UNKNOWN", "INFO", "COLLECTED", "RETRIEVED",
+                     "EMPTY OR UNKNOWN", "NOT ENABLED")):
+        return "unknown"
+
+    # 2. Explicit vulnerable lead — wins over any trailing 'not ...'
+    if s.startswith(("VULNERABLE", "POTENTIALLY VULNERABLE")):
+        return "vuln"
+
+    # 3. Negated-hardening phrasings that read as vulnerable
+    if "NOT ENFORCED" in s or "NOT REQUIRED" in s:
+        return "vuln"
+
+    # 4. Service present-but-secured
+    if "OPEN BUT" in s:
+        return "safe"
+
+    # 5. Safe markers
+    SAFE = ("NOT VULNERABLE", "NOT FOUND", "NOT RUNNING", "NOT READABLE",
+            "NOT DEPLOYED", "NOT ACCESSIBLE", "NOT APPLICABLE", "NO HITS",
+            "HARDENED", "ENFORCED", "CLOSED", "BLOCKED", "OK —", "OK -")
+    if any(m in s for m in SAFE):
+        return "safe"
+    if s in ("DISABLED", "EMPTY", "ENABLED"):   # guest disabled / group empty / PPL enabled
+        return "safe"
+
+    # 6. Vulnerable markers
+    VULN = ("VULNERABLE", "FOUND", "OPEN", "RUNNING", "DUMPED", "READABLE",
+            "HIT", "STALE", "WEAK", "SUSPICIOUS", "ACCESSIBLE", "MEMBERS")
+    if any(m in s for m in VULN):
+        return "vuln"
+
+    return "unknown"
+
+
 def is_vuln(status):
-    s = status.upper()
-    return (
-        "VULNERABLE" in s or "FOUND" in s or "OPEN" in s
-        or "RUNNING" in s or "DUMPED" in s or "READABLE" in s
-        or "HIT" in s or "MEMBERS" in s or "STALE" in s
-        or "WEAK" in s or "SUSPICIOUS" in s or "ENABLED" in s
-    ) and "NOT" not in s and "HARDENED" not in s and "ENFORCED" not in s \
-      and "BLOCKED" not in s and "SKIPPED" not in s
+    return severity(status) == "vuln"
 
 
 def is_safe(status):
-    s = status.upper()
-    return (
-        "NOT VULNERABLE" in s or "NOT FOUND" in s or "HARDENED" in s
-        or "ENFORCED" in s or "CLOSED" in s or "BLOCKED" in s
-        or "EMPTY" in s or "DISABLED" in s or "DEPLOYED" in s
-        or "NO HITS" in s or "NOT APPLICABLE" in s
-    )
+    return severity(status) == "safe"
 
 
 def esc(text):
@@ -2195,7 +2295,8 @@ def esc(text):
                 .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def generate_report(dc_ip, domain, output_dir):
+def generate_report(dc_ip, domain, output_dir, meta=None):
+    meta    = meta or {}
     ts      = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     fname   = f"ad_attack_check_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
     outpath = Path(output_dir) / fname
@@ -2295,6 +2396,13 @@ footer{{text-align:center;color:#484f58;padding:18px;font-size:.78em;
   <p><strong>Target DC:</strong> {esc(dc_ip)} &nbsp;|&nbsp;
      <strong>Domain:</strong> {esc(domain)} &nbsp;|&nbsp;
      <strong>Generated:</strong> {esc(ts)}</p>
+  <p style="color:#8b949e;font-size:.82em;margin-top:6px">
+     Auth: {esc(str(meta.get('auth','?')))} &nbsp;|&nbsp;
+     Checks run: {esc(str(meta.get('checks_selected','?')))} &nbsp;|&nbsp;
+     Commands: {esc(str(meta.get('commands_run','?')))} &nbsp;|&nbsp;
+     Workers: {esc(str(meta.get('jobs','?')))} &nbsp;|&nbsp;
+     Elapsed: {esc(str(meta.get('elapsed_seconds','?')))}s
+     {' &nbsp;|&nbsp; <span style="color:#d29922">PARTIAL (interrupted)</span>' if meta.get('interrupted') else ''}</p>
 </header>
 <div class="container">
   <h2>Executive Summary</h2>
@@ -2317,158 +2425,479 @@ footer{{text-align:center;color:#484f58;padding:18px;font-size:.78em;
     return str(outpath)
 
 
+def generate_json(dc_ip, domain, output_dir, meta=None):
+    """Machine-readable sibling of the HTML report — pipeline-friendly and
+    diffable between runs (re-test tracking, ingestion into report tooling)."""
+    meta = meta or {}
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    fname = f"ad_attack_check_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    outpath = Path(output_dir) / fname
+    doc = {
+        "meta": meta,
+        "summary": {
+            "vulnerable": sum(1 for r in results if is_vuln(r["status"])),
+            "safe":       sum(1 for r in results if is_safe(r["status"])),
+            "total":      len(results),
+        },
+        "results": [
+            {
+                "check": r["check"],
+                "category": CATEGORY_MAP.get(r["check"], "Other"),
+                "status": r["status"],
+                "severity": ("vulnerable" if is_vuln(r["status"])
+                             else "safe" if is_safe(r["status"]) else "unknown"),
+                "recommendation": r["recommendation"],
+                "evidence": r["evidence"],
+            }
+            for r in results
+        ],
+    }
+    outpath.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
+    return str(outpath)
+
+
+# ── Run context, registry, preflight, concurrent runner ───────────────────────
+
+class Ctx:
+    """Everything a check needs to run, bundled so registry thunks stay short."""
+    def __init__(self, dc_ip, username, password, domain, subnet, nh):
+        self.dc_ip = dc_ip
+        self.username = username
+        self.password = password
+        self.domain = domain
+        self.subnet = subnet
+        self.nh = nh
+
+
+class Check:
+    __slots__ = ("key", "name", "category", "tags", "fn")
+    def __init__(self, key, name, category, tags, fn):
+        self.key = key
+        self.name = name
+        self.category = category
+        self.tags = set(tags)
+        self.fn = fn
+
+
+def build_registry(x):
+    """The single source of truth for what runs, in what order, and how it's
+    grouped/filtered. Replaces the old triple-maintained if-ladder. Each entry's
+    fn is a zero-arg thunk so the runner can dispatch generically (and in a
+    pool) without caring about individual check signatures.
+
+    tags: unauth  = no domain creds needed (good for a pre-cred pass)
+          noisy   = louder / lockout-or-alert risk (spray, roasting brute, coerce)
+          privesc = concrete escalation primitives
+          host    = benefits from -s subnet (member-host, not just the DC)
+    """
+    dc, u, pw, dom, sub, nh = x.dc_ip, x.username, x.password, x.domain, x.subnet, x.nh
+    return [
+        Check("smb", "SMB Signing", "Signing & Relay", {"quickwin", "unauth"}, lambda: check_smb_signing(dc, u, pw, dom, nh)),
+        Check("ldapsign", "LDAP Signing", "Signing & Relay", {"quickwin"}, lambda: check_ldap_signing(dc, u, pw, dom, nh)),
+        Check("llmnr", "LLMNR / NBT-NS", "Signing & Relay", set(), lambda: check_llmnr_nbtns(dc, u, pw, dom, nh)),
+        Check("maq", "MachineAccountQuota", "Machine Accounts", {"quickwin"}, lambda: check_maq(dc, u, pw, dom, nh)),
+        Check("nopac", "noPac", "Machine Accounts", set(), lambda: check_nopac(dc, u, pw, dom, nh)),
+        Check("prewin2000", "Pre-Win2000 Accounts", "Machine Accounts", set(), lambda: check_pre_win2000(dc, u, pw, dom, nh)),
+        Check("coercion", "Coercion (coerce_plus)", "Coercion", {"noisy"}, lambda: check_coercion(dc, u, pw, dom, nh)),
+        Check("webdav", "WebClient / WebDAV", "Coercion", {"host"}, lambda: check_webdav(dc, u, pw, dom, sub, nh)),
+        Check("spooler", "Print Spooler", "Coercion", set(), lambda: check_spooler(dc, u, pw, dom, nh)),
+        Check("ldaps", "LDAPS Port 636", "ADCS", {"unauth"}, lambda: check_ldaps(dc)),
+        Check("adcs", "ADCS", "ADCS", {"quickwin"}, lambda: check_adcs(dc, u, pw, dom, nh)),
+        Check("kerberoast", "Kerberoasting", "Kerberos", {"quickwin"}, lambda: check_kerberoast(dc, u, pw, dom, nh)),
+        Check("asrep", "AS-REP Roasting", "Kerberos", {"quickwin"}, lambda: check_asreproast(dc, u, pw, dom, nh)),
+        Check("userenum", "User Enumeration", "Kerberos", {"unauth", "noisy"}, lambda: check_user_enum(dc, dom, nh)),
+        Check("dupespns", "Duplicate SPNs", "Kerberos", set(), lambda: check_duplicate_spns(dc, u, pw, dom, nh)),
+        Check("krbtgt", "krbtgt Password Age", "Kerberos", set(), lambda: check_krbtgt_age(dc, u, pw, dom, nh)),
+        Check("zerologon", "Zerologon", "Critical CVEs", {"quickwin", "noisy", "unauth"}, lambda: check_zerologon(dc, u, pw, dom, nh)),
+        Check("ms17010", "EternalBlue MS17-010", "Critical CVEs", {"unauth"}, lambda: check_eternalblue(dc, u, pw, nh)),
+        Check("exchange", "Exchange Detection", "Critical CVEs", set(), lambda: check_exchange(dc, u, pw, dom, nh)),
+        Check("privexchange", "PrivExchange / Exchange DACL", "Critical CVEs", set(), lambda: check_privexchange(dc, u, pw, dom, nh)),
+        Check("delegation", "Delegation", "Delegation", {"quickwin"}, lambda: check_delegation(dc, u, pw, dom, nh)),
+        Check("passpol", "Password Policy", "Credential Exposure", {"quickwin"}, lambda: check_password_policy(dc, u, pw, dom, nh)),
+        Check("fgpp", "Fine-Grained Password Policies", "Credential Exposure", set(), lambda: check_fgpp(dc, u, pw, dom, nh)),
+        Check("gpp", "GPP Passwords", "Credential Exposure", {"quickwin"}, lambda: check_gpp_passwords(dc, u, pw, dom, nh)),
+        Check("gppautologin", "GPP Autologin", "Credential Exposure", set(), lambda: check_gpp_autologin(dc, u, pw, dom, nh)),
+        Check("laps", "LAPS", "Credential Exposure", {"quickwin"}, lambda: check_laps(dc, u, pw, dom, nh)),
+        Check("descriptions", "Passwords in Descriptions", "Credential Exposure", set(), lambda: check_passwords_in_descriptions(dc, u, pw, dom, nh)),
+        Check("cleartextldap", "Cleartext LDAP Passwords", "Credential Exposure", set(), lambda: check_cleartext_ldap_passwords(dc, u, pw, dom, nh)),
+        Check("passnoreq", "Password Not Required", "Credential Exposure", set(), lambda: check_password_not_required(dc, u, pw, dom, nh)),
+        Check("passneverexpires", "Password Never Expires", "Credential Exposure", set(), lambda: check_password_never_expires(dc, u, pw, dom, nh)),
+        Check("gmsa", "gMSA Passwords", "Credential Exposure", set(), lambda: check_gmsa(dc, u, pw, dom, nh)),
+        Check("spray", "Password Spray", "Credential Exposure", {"noisy"}, lambda: check_password_spray(dc, u, pw, dom, nh)),
+        Check("useqpass", "User = Password", "Credential Exposure", {"noisy"}, lambda: check_user_equals_password(dc, u, pw, dom, nh)),
+        Check("samlsa", "SAM / LSA Dump", "Credential Exposure", {"noisy"}, lambda: check_sam_lsa(dc, u, pw, dom, nh)),
+        Check("lsappl", "LSA Protection (PPL)", "Credential Exposure", set(), lambda: check_lsa_ppl(dc, u, pw, dom, nh)),
+        Check("admincount", "AdminCount Users", "Privileged Groups", set(), lambda: check_admincount(dc, u, pw, dom, nh)),
+        Check("privgroups", "Privileged Group Membership", "Privileged Groups", {"quickwin"}, lambda: check_priv_groups(dc, u, pw, dom, nh)),
+        Check("dnsadmins", "DnsAdmins Group", "Privileged Groups", set(), lambda: check_dnsadmins(dc, u, pw, dom, nh)),
+        Check("backupops", "Backup Operators", "Privileged Groups", set(), lambda: check_backup_operators(dc, u, pw, dom, nh)),
+        Check("sidhistory", "SIDHistory", "Privileged Groups", set(), lambda: check_sidhistory(dc, u, pw, dom, nh)),
+        Check("adminsdh", "AdminSDHolder ACL", "Privileged Groups", set(), lambda: check_adminsdh(dc, u, pw, dom, nh)),
+        Check("guest", "Guest Account", "Privileged Groups", set(), lambda: check_guest_account(dc, u, pw, dom, nh)),
+        Check("dacl", "DACL / ACL Abuse", "ACL / GPO", {"privesc"}, lambda: check_dacl_abuse(dc, u, pw, dom, nh)),
+        Check("gpo", "GPO Permissions", "ACL / GPO", {"privesc"}, lambda: check_gpo_permissions(dc, u, pw, dom, nh)),
+        Check("ipv6", "IPv6 Enabled", "Network & Services", {"host"}, lambda: check_ipv6(dc, u, pw, dom, sub, nh)),
+        Check("winrm", "WinRM Access", "Network & Services", set(), lambda: check_winrm(dc, u, pw, dom, nh)),
+        Check("mssql", "MSSQL Instances", "Network & Services", {"host"}, lambda: check_mssql_instances(dc, u, pw, dom, sub, nh)),
+        Check("rdpnla", "RDP NLA", "Network & Services", {"unauth"}, lambda: check_rdp_nla(dc, u, pw, dom, nh)),
+        Check("smbv1", "SMBv1 Enabled", "Network & Services", {"unauth"}, lambda: check_smbv1(dc, u, pw, dom, nh)),
+        Check("snmp", "SNMP Community Strings", "Network & Services", {"unauth", "host"}, lambda: check_snmp(dc, sub)),
+        Check("nullbind", "LDAP Null Bind", "Network & Services", {"unauth"}, lambda: check_ldap_null_bind(dc)),
+        Check("nfs", "NFS Exports", "Network & Services", {"unauth", "host"}, lambda: check_nfs(dc, sub)),
+        Check("ipmi", "IPMI / BMC", "Network & Services", {"unauth", "host"}, lambda: check_ipmi(dc, sub)),
+        Check("wsus", "WSUS Misconfiguration", "Network & Services", set(), lambda: check_wsus(dc, u, pw, dom, nh)),
+        Check("shares", "SMB Share Enumeration", "Network & Services", {"host"}, lambda: check_smb_shares(dc, u, pw, dom, nh)),
+        Check("spider", "Share Spider", "Network & Services", {"host", "noisy"}, lambda: check_share_spider(dc, u, pw, dom, nh)),
+        Check("rodc", "RODC Password Replication", "Network & Services", set(), lambda: check_rodc(dc, u, pw, dom, nh)),
+        Check("smtp", "SMTP Open Relay", "Exposed Services", {"unauth", "host"}, lambda: check_smtp_relay(dc, sub)),
+        Check("redis", "Redis Unauthenticated", "Exposed Services", {"unauth", "host"}, lambda: check_redis(dc, sub)),
+        Check("elastic", "Elasticsearch Unauthenticated", "Exposed Services", {"unauth"}, lambda: check_elasticsearch(dc)),
+        Check("jenkins", "Jenkins/Tomcat Default Creds", "Exposed Services", {"unauth", "host"}, lambda: check_jenkins_tomcat(dc, sub)),
+        Check("mssqllinked", "MSSQL Linked Servers", "Exposed Services", {"host"}, lambda: check_mssql_linked(dc, u, pw, dom, sub, nh)),
+        Check("trusts", "Domain Trusts", "AD Intelligence", set(), lambda: check_trusts(dc, u, pw, dom, nh)),
+        Check("azuread", "Azure AD Connect", "AD Intelligence", set(), lambda: check_azure_ad_connect(dc, u, pw, dom, nh)),
+        Check("bloodhound", "BloodHound Collection", "AD Intelligence", {"noisy"}, lambda: check_bloodhound(dc, u, pw, dom, nh)),
+        Check("avedr", "AV/EDR Detection", "AD Intelligence", set(), lambda: check_av_edr(dc, u, pw, dom, nh)),
+        Check("aie", "AlwaysInstallElevated", "AD Intelligence", {"privesc"}, lambda: check_always_install_elevated(dc, u, pw, dom, nh)),
+        Check("localadmin", "Local Admin Discovery", "AD Intelligence", {"host"}, lambda: check_local_admin(dc, u, pw, dom, sub, nh)),
+        Check("rbcd", "RBCD", "PrivEsc — AD", {"privesc"}, lambda: check_rbcd(dc, u, pw, dom, nh)),
+        Check("shadowcreds", "Shadow Credentials", "PrivEsc — AD", {"privesc"}, lambda: check_shadow_credentials(dc, u, pw, dom, nh)),
+        Check("dcsync", "DCSync Rights (Non-Standard)", "PrivEsc — AD", {"privesc"}, lambda: check_dcsync_rights(dc, u, pw, dom, nh)),
+        Check("gpoabuse", "GPO Write Abuse", "PrivEsc — AD", {"privesc"}, lambda: check_gpo_abuse(dc, u, pw, dom, nh)),
+        Check("badsuccessor", "BadSuccessor", "PrivEsc — AD", {"privesc"}, lambda: check_badsuccessor(dc, u, pw, dom, nh)),
+        Check("ntlmv1", "NTLMv1 Accepted", "PrivEsc — AD", {"privesc", "host"}, lambda: check_ntlmv1(dc, u, pw, dom, sub, nh)),
+        Check("timeroast", "Timeroasting", "PrivEsc — AD", {"privesc"}, lambda: check_timeroast(dc, u, pw, dom, nh)),
+        Check("unquotedsvc", "Unquoted Service Paths", "PrivEsc — Local", {"privesc", "host"}, lambda: check_unquoted_service_paths(dc, u, pw, dom, sub, nh)),
+        Check("seimpers", "Dangerous Token Privileges", "PrivEsc — Local", {"privesc"}, lambda: check_seimpersonate(dc, u, pw, dom, nh)),
+        Check("autologon", "Autologon Registry Credentials", "PrivEsc — Local", {"privesc", "host"}, lambda: check_autologon_registry(dc, u, pw, dom, sub, nh)),
+        Check("dpapi", "DPAPI Masterkeys", "Credential Exposure", {"host"}, lambda: check_dpapi(dc, u, pw, dom, sub, nh)),
+        Check("keepass", "KeePass Databases", "Credential Exposure", {"host"}, lambda: check_keepass(dc, u, pw, dom, sub, nh)),
+        Check("veeam", "Veeam Backup Credentials", "Credential Exposure", {"host"}, lambda: check_veeam_creds(dc, u, pw, dom, sub, nh)),
+        Check("mremoteng", "mRemoteNG Credentials", "Credential Exposure", {"host"}, lambda: check_mremoteng_creds(dc, u, pw, dom, sub, nh)),
+        Check("wifi", "WiFi Passwords", "Credential Exposure", {"host"}, lambda: check_wifi_passwords(dc, u, pw, dom, sub, nh)),
+    ]
+
+
+# ── Preflight ──────────────────────────────────────────────────────────────────
+
+# (primary binary, purpose, alt binary that also satisfies it)
+REQUIRED_TOOLS = [
+    ("nxc", "NetExec — core engine, most checks need it", "netexec"),
+]
+OPTIONAL_TOOLS = [
+    ("certipy-ad",      "ADCS ESC1–ESC13 / ESC8 enumeration",   "certipy"),
+    ("GetUserSPNs.py",  "impacket — SPNs / duplicate SPNs",      None),
+    ("findDelegation.py", "impacket — constrained delegation",   None),
+    ("kerbrute",        "user enumeration without creds",        None),
+    ("nmap",            "IPMI / SMTP relay / SNMP / port checks", None),
+    ("ldapsearch",      "LDAP null bind",                        None),
+    ("rpcclient",       "domain trust fallback",                 None),
+    ("redis-cli",       "Redis unauthenticated check",           None),
+]
+
+
+def _have(primary, alt=None):
+    return tool_exists(primary) or (alt is not None and tool_exists(alt))
+
+
+def preflight(ctx, force, no_creds=False):
+    """Inventory tools once and validate creds once, before burning time on
+    dozens of checks that would all fail the same way. Returns True to proceed.
+
+    In no_creds mode there is nothing to validate, so instead we probe the DC
+    anonymously (null session), report whether RestrictAnonymous is blocking us,
+    and best-effort auto-discover the domain from the SMB banner."""
+    section("Preflight")
+
+    missing_required = []
+    for primary, purpose, alt in REQUIRED_TOOLS:
+        if _have(primary, alt):
+            log(f"{primary:<16} present  — {purpose}", "good")
+        else:
+            log(f"{primary:<16} MISSING  — {purpose}", "bad")
+            missing_required.append(primary)
+
+    for primary, purpose, alt in OPTIONAL_TOOLS:
+        if _have(primary, alt):
+            log(f"{primary:<16} present  — {purpose}", "good")
+        else:
+            log(f"{primary:<16} absent   — {purpose} (those checks will self-skip)", "warn")
+
+    if missing_required and not force:
+        log("Core tooling missing — most checks will do nothing. "
+            "Install NetExec (pip install netexec) or re-run with --force.", "bad")
+        return False
+
+    # No-credential mode: nothing to validate. Probe anonymously, learn what we
+    # can, and auto-discover the domain from the DC's SMB banner if not supplied.
+    if no_creds:
+        log("No-credential mode — probing DC anonymously (null session)...")
+        out = run(f"nxc smb {ctx.dc_ip} -u '' -p ''", timeout=30)
+        up = out.upper()
+        if "ERROR: COMMAND NOT FOUND" in up:
+            log("nxc unavailable — port/network checks may still run.", "warn")
+        elif out.strip():
+            m = re.search(r"\(domain:([^)]+)\)", out)
+            if m and not ctx.domain:
+                ctx.domain = m.group(1).strip()
+                log(f"Discovered domain from DC banner: {ctx.domain}", "good")
+            if "STATUS_ACCESS_DENIED" in up or "STATUS_LOGON_FAILURE" in up:
+                log("Null session refused (RestrictAnonymous). Banner-based and "
+                    "network checks still work; LDAP/SAMR enum will likely be blank.", "warn")
+            else:
+                log("DC reachable via null session.", "good")
+        else:
+            log("No response to anonymous probe — verify reachability/routing.", "warn")
+        return True
+
+    # Credential validation — a single authenticated SMB bind against the DC.
+    log("Validating credentials against the DC...")
+    out = run(f"nxc smb {ctx.dc_ip} {nxc_cred(ctx.username, ctx.password, ctx.nh)} -d '{ctx.domain}'", timeout=30)
+    up = out.upper()
+    if "ERROR: COMMAND NOT FOUND" in up:
+        log("Cannot validate creds (nxc unavailable) — continuing anyway.", "warn")
+    elif "STATUS_LOGON_FAILURE" in up or "STATUS_ACCOUNT_LOCKED_OUT" in up or "STATUS_ACCESS_DENIED" in up:
+        log("Credential check FAILED against the DC:", "bad")
+        for ln in out.strip().splitlines()[:4]:
+            log(f"   {ln}", "warn")
+        if not force:
+            log("Refusing to run 80+ checks with bad creds. Fix creds or use --force.", "bad")
+            return False
+        log("Continuing despite failed credential check (--force).", "warn")
+    elif "[+]" in out:
+        log("Credentials valid.", "good")
+    else:
+        log("Credential status inconclusive — continuing.", "warn")
+
+    return True
+
+
+# ── Concurrent runner ──────────────────────────────────────────────────────────
+
+_print_lock = threading.Lock()
+
+
+def _run_one(check):
+    """Worker: buffer this check's console output, run it, return the buffer so
+    the main thread can flush it atomically (no interleaving across threads)."""
+    _tls.buffer = []
+    t0 = time.time()
+    try:
+        check.fn()
+    except Exception as e:
+        store(check.name, "ERROR — check crashed", f"{type(e).__name__}: {e}")
+        _emit(f"  {R}[-]{RST} {check.name} crashed: {type(e).__name__}: {e}")
+    dt = time.time() - t0
+    lines = _tls.buffer
+    _tls.buffer = None
+    return check, dt, lines
+
+
+def run_checks(checks, jobs):
+    total = len(checks)
+    done = 0
+
+    if jobs <= 1:
+        for c in checks:                       # sequential: stream live like before
+            t0 = time.time()
+            try:
+                c.fn()
+            except Exception as e:
+                store(c.name, "ERROR — check crashed", f"{type(e).__name__}: {e}")
+                log(f"{c.name} crashed: {e}", "bad")
+            done += 1
+            log(f"[{done}/{total}] {c.name} done ({time.time()-t0:.1f}s)", "info")
+        return
+
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        futures = [ex.submit(_run_one, c) for c in checks]
+        try:
+            for fut in as_completed(futures):
+                c, dt, lines = fut.result()
+                done += 1
+                with _print_lock:
+                    for ln in lines:
+                        print(ln)
+                    print(f"  {C}[{done}/{total}]{RST} {BOLD}{c.name}{RST} {W}({dt:.1f}s){RST}")
+        except KeyboardInterrupt:
+            log("Interrupted — cancelling remaining checks, writing partial report...", "warn")
+            for f in futures:
+                f.cancel()
+            raise
+
+
+def select_checks(registry, only, skip, tags, skip_tags):
+    """Resolve the final ordered check list from the CLI filters."""
+    only, skip = set(only), set(skip)
+    tags, skip_tags = set(tags), set(skip_tags)
+    chosen = []
+    for c in registry:
+        if only and c.key not in only:
+            continue
+        if c.key in skip:
+            continue
+        if tags and not (c.tags & tags):
+            continue
+        if skip_tags and (c.tags & skip_tags):
+            continue
+        chosen.append(c)
+    return chosen
+
+
+def print_check_table(registry):
+    print(f"\n{BOLD}{C}Available checks ({len(registry)}):{RST}\n")
+    print(f"  {BOLD}{'KEY':<16}{'CATEGORY':<22}{'TAGS':<26}NAME{RST}")
+    for c in registry:
+        tags = ",".join(sorted(c.tags)) or "-"
+        print(f"  {c.key:<16}{c.category:<22}{tags:<26}{c.name}")
+    print(f"\n  Filter with --only / --skip (by key) or --tags / --skip-tags "
+          f"(unauth, noisy, privesc, host, quickwin).\n")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     banner()
     p = argparse.ArgumentParser(
-        description="AD Attack Path Checker "
+        description="AD Attack Path Checker — plonk-and-go internal AD assessment.",
+        epilog="Filter keys/tags come from --list-checks. Tags: unauth, noisy, privesc, host, quickwin.",
     )
-    p.add_argument("-dc",      required=True,  dest="dc_ip",   help="Domain controller IP")
-    p.add_argument("-u",       required=True,  dest="username", help="Username")
-    p.add_argument("-p",       default=None,   dest="password", help="Password (mutually exclusive with -H)")
-    p.add_argument("-H",       default=None,   dest="nt_hash",  help="NT hash for Pass-the-Hash (format: NTHASH or LMHASH:NTHASH)")
-    p.add_argument("-d",       required=True,  dest="domain",  help="Domain FQDN")
-    p.add_argument("-s",       default=None,   dest="subnet",  help="Subnet for host-wide checks (e.g. 10.0.0.0/24)")
-    p.add_argument("-o",       default="./loot", dest="output", help="Output directory (default: ./loot)")
-    p.add_argument("--skip",   nargs="+",      default=[],     metavar="CHECK",
-                   help="Checks to skip (e.g. --skip zerologon ms17010)")
-    p.add_argument("--wordlist", default=None,
-                   help="Path to username wordlist for kerbrute (overrides auto-detection)")
+    p.add_argument("-dc",  dest="dc_ip",    help="Domain controller IP")
+    p.add_argument("-u",   dest="username", help="Username")
+    p.add_argument("-p",   dest="password", default=None, help="Password (mutually exclusive with -H)")
+    p.add_argument("-H",   dest="nt_hash",  default=None, help="NT hash for Pass-the-Hash (NTHASH or LMHASH:NTHASH)")
+    p.add_argument("-d",   dest="domain",   help="Domain FQDN")
+    p.add_argument("-s",   dest="subnet",   default=None, help="Subnet for host-wide checks (e.g. 10.0.0.0/24)")
+    p.add_argument("-o",   dest="output",   default="./loot", help="Output directory (default: ./loot)")
+
+    # Selection filters (all operate on the single registry)
+    p.add_argument("--skip",      nargs="+", default=[], metavar="KEY",  help="Checks to skip by key")
+    p.add_argument("--only",      nargs="+", default=[], metavar="KEY",  help="Run ONLY these check keys")
+    p.add_argument("--tags",      nargs="+", default=[], metavar="TAG",  help="Run only checks with any of these tags")
+    p.add_argument("--skip-tags", nargs="+", default=[], metavar="TAG",  dest="skip_tags",
+                   help="Skip checks with any of these tags (e.g. --skip-tags noisy)")
+    p.add_argument("--list-checks", action="store_true", help="List all checks (key/category/tags) and exit")
+
+    # Execution / output
+    p.add_argument("-j", "--jobs", type=int, default=10, help="Parallel worker threads (default 10; 1 = sequential)")
+    p.add_argument("--timeout-scale", type=float, default=1.0, dest="timeout_scale",
+                   help="Multiply every command timeout (slow/large estates), e.g. 2.0")
+    p.add_argument("--wordlist", default=None, help="Username wordlist for kerbrute (overrides auto-detection)")
+    p.add_argument("--json",   action="store_true", help="Also write a machine-readable JSON report")
+    p.add_argument("--verbose", action="store_true", help="Print raw command output to the console")
+    p.add_argument("--force",  action="store_true", help="Run even if preflight (tools/creds) fails")
+    p.add_argument("--no-creds", action="store_true", dest="no_creds",
+                   help="Credential-less pass (null session). Runs the 'unauth' check set only, "
+                        "unless you also pass --only/--tags. -u/-d optional; domain auto-detected "
+                        "from the DC banner when omitted.")
     args = p.parse_args()
 
-    # Override wordlist search if user provides one
+    # --list-checks needs no target/creds.
+    if args.list_checks:
+        print_check_table(build_registry(Ctx("", "", "", "", None, "")))
+        return
+
+    pw = args.password or ""
+    nh = args.nt_hash or ""
+
+    # No-credential mode is either explicit (--no-creds) or inferred when the user
+    # supplied no auth material at all. It runs a null session against the DC, so
+    # -u and -d become optional (domain is auto-detected from the SMB banner).
+    no_creds = args.no_creds or (not args.username and not pw and not nh)
+
+    # Required-when-running args (kept out of argparse 'required' so --list-checks works alone)
+    required = (("-dc", args.dc_ip),) if no_creds \
+        else (("-dc", args.dc_ip), ("-u", args.username), ("-d", args.domain))
+    missing = [f for f, v in required if not v]
+    if missing:
+        print(f"\n{R}[!] ERROR: missing required argument(s): {', '.join(missing)}{RST}\n")
+        sys.exit(1)
+
+    if not no_creds and not pw and not nh:
+        print(f"\n{R}[!] ERROR: Supply -p <password>, -H <NT hash>, or use --no-creds{RST}\n")
+        sys.exit(1)
+
+    username = args.username or ""     # empty ⇒ null session
+
     if args.wordlist:
         WORDLIST_PATHS.insert(0, args.wordlist)
 
-    skips   = [s.lower() for s in args.skip]
-    dc_ip   = args.dc_ip
-    u       = args.username
-    domain  = args.domain
-    subnet  = args.subnet
+    # Populate global run config
+    CFG.verbose       = args.verbose
+    CFG.timeout_scale = args.timeout_scale
+    CFG.jobs          = max(1, args.jobs)
+    CFG.loot_dir      = args.output           # keep harvested loot next to the report
 
-    # Credential validation
-    pw = args.password or ""
-    nh = args.nt_hash or ""
-    if nh:
-        # Normalise: accept bare NT hash (32 hex chars) or LMHASH:NTHASH
-        if ":" not in nh:
-            nh = nh  # NXC accepts bare NT hash with -H
-    if not pw and not nh:
-        print(f"\n{R}[!] ERROR: Supply either -p <password> or -H <NT hash>{RST}\n")
-        sys.exit(1)
+    ctx = Ctx(args.dc_ip, username, pw, args.domain or "", args.subnet, nh)
 
-    log(f"Target DC : {dc_ip}", "info")
-    log(f"Domain    : {domain}", "info")
-    log(f"Username  : {u}", "info")
-    if nh:
-        log(f"Auth      : Pass-the-Hash ({nh[:8]}...)", "warn")
-    else:
-        log(f"Auth      : Password", "info")
-    if subnet:
-        log(f"Subnet    : {subnet}", "info")
-    if skips:
-        log(f"Skipping  : {', '.join(skips)}", "warn")
+    auth_label = "None (null session)" if no_creds \
+        else (f"Pass-the-Hash ({nh[:8]}...)" if nh else "Password")
+    log(f"Target DC : {ctx.dc_ip}", "info")
+    log(f"Domain    : {ctx.domain or '(auto-detect)'}", "info")
+    log(f"Username  : {ctx.username or '(null session)'}", "info")
+    log(f"Auth      : {auth_label}", "warn" if (nh or no_creds) else "info")
+    if ctx.subnet:
+        log(f"Subnet    : {ctx.subnet}", "info")
+    log(f"Workers   : {CFG.jobs}", "info")
 
-    # ── Run checks ────────────────────────────────────────────────────────────
-    if "smb"         not in skips: check_smb_signing(dc_ip, u, pw, domain, nh)
-    if "ldapsign"    not in skips: check_ldap_signing(dc_ip, u, pw, domain, nh)
-    if "llmnr"       not in skips: check_llmnr_nbtns(dc_ip, u, pw, domain, nh)
-    if "maq"         not in skips: check_maq(dc_ip, u, pw, domain, nh)
-    if "nopac"       not in skips: check_nopac(dc_ip, u, pw, domain, nh)
-    if "prewin2000"  not in skips: check_pre_win2000(dc_ip, u, pw, domain, nh)
-    if "coercion"    not in skips: check_coercion(dc_ip, u, pw, domain, nh)
-    if "webdav"      not in skips: check_webdav(dc_ip, u, pw, domain, subnet, nh)
-    if "spooler"     not in skips: check_spooler(dc_ip, u, pw, domain, nh)
-    if "ldaps"       not in skips: check_ldaps(dc_ip)
-    if "adcs"        not in skips: check_adcs(dc_ip, u, pw, domain, nh)
-    if "kerberoast"  not in skips: check_kerberoast(dc_ip, u, pw, domain, nh)
-    if "asrep"       not in skips: check_asreproast(dc_ip, u, pw, domain, nh)
-    if "userenum"    not in skips: check_user_enum(dc_ip, domain, nh)
-    if "dupespns"    not in skips: check_duplicate_spns(dc_ip, u, pw, domain, nh)
-    if "krbtgt"      not in skips: check_krbtgt_age(dc_ip, u, pw, domain, nh)
-    if "zerologon"   not in skips: check_zerologon(dc_ip, u, pw, domain, nh)
-    if "ms17010"     not in skips: check_eternalblue(dc_ip, u, pw, nh)
-    if "exchange"    not in skips: check_exchange(dc_ip, u, pw, domain, nh)
-    if "privexchange" not in skips: check_privexchange(dc_ip, u, pw, domain, nh)
-    if "delegation"  not in skips: check_delegation(dc_ip, u, pw, domain, nh)
-    if "passpol"     not in skips: check_password_policy(dc_ip, u, pw, domain, nh)
-    if "fgpp"        not in skips: check_fgpp(dc_ip, u, pw, domain, nh)
-    if "gpp"         not in skips: check_gpp_passwords(dc_ip, u, pw, domain, nh)
-    if "gppautologin" not in skips: check_gpp_autologin(dc_ip, u, pw, domain, nh)
-    if "laps"        not in skips: check_laps(dc_ip, u, pw, domain, nh)
-    if "descriptions" not in skips: check_passwords_in_descriptions(dc_ip, u, pw, domain, nh)
-    if "cleartextldap" not in skips: check_cleartext_ldap_passwords(dc_ip, u, pw, domain, nh)
-    if "passnoreq"   not in skips: check_password_not_required(dc_ip, u, pw, domain, nh)
-    if "passneverexpires" not in skips: check_password_never_expires(dc_ip, u, pw, domain, nh)
-    if "gmsa"        not in skips: check_gmsa(dc_ip, u, pw, domain, nh)
-    if "spray"       not in skips: check_password_spray(dc_ip, u, pw, domain, nh)
-    if "useqpass"    not in skips: check_user_equals_password(dc_ip, u, pw, domain, nh)
-    if "samlsa"      not in skips: check_sam_lsa(dc_ip, u, pw, domain, nh)
-    if "lsappl"      not in skips: check_lsa_ppl(dc_ip, u, pw, domain, nh)
-    if "admincount"  not in skips: check_admincount(dc_ip, u, pw, domain, nh)
-    if "privgroups"  not in skips: check_priv_groups(dc_ip, u, pw, domain, nh)
-    if "dnsadmins"   not in skips: check_dnsadmins(dc_ip, u, pw, domain, nh)
-    if "backupops"   not in skips: check_backup_operators(dc_ip, u, pw, domain, nh)
-    if "sidhistory"  not in skips: check_sidhistory(dc_ip, u, pw, domain, nh)
-    if "adminsdh"    not in skips: check_adminsdh(dc_ip, u, pw, domain, nh)
-    if "guest"       not in skips: check_guest_account(dc_ip, u, pw, domain, nh)
-    if "dacl"        not in skips: check_dacl_abuse(dc_ip, u, pw, domain, nh)
-    if "gpo"         not in skips: check_gpo_permissions(dc_ip, u, pw, domain, nh)
-    if "ipv6"        not in skips: check_ipv6(dc_ip, u, pw, domain, subnet, nh)
-    if "winrm"       not in skips: check_winrm(dc_ip, u, pw, domain, nh)
-    if "mssql"       not in skips: check_mssql_instances(dc_ip, u, pw, domain, subnet, nh)
-    if "rdpnla"      not in skips: check_rdp_nla(dc_ip, u, pw, domain, nh)
-    if "smbv1"       not in skips: check_smbv1(dc_ip, u, pw, domain, nh)
-    if "snmp"        not in skips: check_snmp(dc_ip, subnet)
-    if "nullbind"    not in skips: check_ldap_null_bind(dc_ip)
-    if "nfs"         not in skips: check_nfs(dc_ip, subnet)
-    if "ipmi"        not in skips: check_ipmi(dc_ip, subnet)
-    if "wsus"        not in skips: check_wsus(dc_ip, u, pw, domain, nh)
-    if "shares"      not in skips: check_smb_shares(dc_ip, u, pw, domain, nh)
-    if "spider"      not in skips: check_share_spider(dc_ip, u, pw, domain, nh)
-    if "rodc"        not in skips: check_rodc(dc_ip, u, pw, domain, nh)
-    if "smtp"        not in skips: check_smtp_relay(dc_ip, subnet)
-    if "redis"       not in skips: check_redis(dc_ip, subnet)
-    if "elastic"     not in skips: check_elasticsearch(dc_ip)
-    if "jenkins"     not in skips: check_jenkins_tomcat(dc_ip, subnet)
-    if "mssqllinked" not in skips: check_mssql_linked(dc_ip, u, pw, domain, subnet, nh)
-    if "trusts"      not in skips: check_trusts(dc_ip, u, pw, domain, nh)
-    if "azuread"     not in skips: check_azure_ad_connect(dc_ip, u, pw, domain, nh)
-    if "bloodhound"  not in skips: check_bloodhound(dc_ip, u, pw, domain, nh)
-    if "avedr"       not in skips: check_av_edr(dc_ip, u, pw, domain, nh)
-    if "aie"         not in skips: check_always_install_elevated(dc_ip, u, pw, domain, nh)
-    if "localadmin"  not in skips: check_local_admin(dc_ip, u, pw, domain, subnet, nh)
+    # ── Preflight ─────────────────────────────────────────────────────────────
+    if not preflight(ctx, args.force, no_creds):
+        sys.exit(2)
 
-    # ── PrivEsc — AD ──────────────────────────────────────────────────────────
-    if "rbcd"           not in skips: check_rbcd(dc_ip, u, pw, domain, nh)
-    if "shadowcreds"    not in skips: check_shadow_credentials(dc_ip, u, pw, domain, nh)
-    if "dcsync"         not in skips: check_dcsync_rights(dc_ip, u, pw, domain, nh)
-    if "gpoabuse"       not in skips: check_gpo_abuse(dc_ip, u, pw, domain, nh)
-    if "badsuccessor"   not in skips: check_badsuccessor(dc_ip, u, pw, domain, nh)
-    if "ntlmv1"         not in skips: check_ntlmv1(dc_ip, u, pw, domain, subnet, nh)
-    if "timeroast"      not in skips: check_timeroast(dc_ip, u, pw, domain, nh)
-    # ── PrivEsc — Local ───────────────────────────────────────────────────────
-    if "unquotedsvc"    not in skips: check_unquoted_service_paths(dc_ip, u, pw, domain, subnet, nh)
-    if "seimpers"       not in skips: check_seimpersonate(dc_ip, u, pw, domain, nh)
-    if "autologon"      not in skips: check_autologon_registry(dc_ip, u, pw, domain, subnet, nh)
-    # ── Credential Exposure (new) ─────────────────────────────────────────────
-    if "dpapi"          not in skips: check_dpapi(dc_ip, u, pw, domain, subnet, nh)
-    if "keepass"        not in skips: check_keepass(dc_ip, u, pw, domain, subnet, nh)
-    if "veeam"          not in skips: check_veeam_creds(dc_ip, u, pw, domain, subnet, nh)
-    if "mremoteng"      not in skips: check_mremoteng_creds(dc_ip, u, pw, domain, subnet, nh)
-    if "wifi"           not in skips: check_wifi_passwords(dc_ip, u, pw, domain, subnet, nh)
+    # ── Select & run ──────────────────────────────────────────────────────────
+    # In no-creds mode, default to the 'unauth' set so we don't fire 60+ authed
+    # checks that would only spew logon failures. --only/--tags override this.
+    eff_tags = args.tags
+    if no_creds and not args.only and not args.tags:
+        eff_tags = ["unauth"]
+        log("No-cred pass: running the 'unauth' check set — "
+            "narrow or widen with --only / --tags.", "info")
 
-    # ── Report ────────────────────────────────────────────────────────────────
+    registry = build_registry(ctx)
+    checks = select_checks(registry, args.only, [s.lower() for s in args.skip],
+                           eff_tags, [t.lower() for t in args.skip_tags])
+    if not checks:
+        log("No checks selected after filters — nothing to do.", "warn")
+        sys.exit(0)
+
+    section(f"Running {len(checks)} checks ({CFG.jobs} worker{'s' if CFG.jobs > 1 else ''})")
+    interrupted = False
+    start = time.time()
+    try:
+        run_checks(checks, CFG.jobs)
+    except KeyboardInterrupt:
+        interrupted = True
+    elapsed = time.time() - start
+
+    # ── Report (always, even on interrupt) ────────────────────────────────────
     section("Generating Report")
-    report = generate_report(dc_ip, domain, args.output)
-    log(f"Report saved to: {report}", "good")
+    meta = {
+        "dc_ip": ctx.dc_ip, "domain": ctx.domain, "username": ctx.username,
+        "auth": "none" if no_creds else ("pth" if nh else "password"), "subnet": ctx.subnet,
+        "checks_selected": len(checks), "commands_run": CFG.commands_run,
+        "elapsed_seconds": round(elapsed, 1), "jobs": CFG.jobs,
+        "interrupted": interrupted,
+        "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    report = generate_report(ctx.dc_ip, ctx.domain, args.output, meta)
+    log(f"HTML report : {report}", "good")
+    if args.json:
+        jpath = generate_json(ctx.dc_ip, ctx.domain, args.output, meta)
+        log(f"JSON report : {jpath}", "good")
 
-    # ── Final Summary ─────────────────────────────────────────────────────────
-    print(f"\n{BOLD}{C}{'═'*60}{RST}")
-    print(f"{BOLD}  FINAL SUMMARY{RST}")
-    print(f"{BOLD}{C}{'═'*60}{RST}")
-    for r in results:
+    # ── Final Summary (vulnerable first) ──────────────────────────────────────
+    ordered = sorted(results, key=lambda r: (0 if is_vuln(r["status"]) else (2 if is_safe(r["status"]) else 1)))
+    vuln_n = sum(1 for r in results if is_vuln(r["status"]))
+    safe_n = sum(1 for r in results if is_safe(r["status"]))
+    unk_n  = len(results) - vuln_n - safe_n
+
+    print(f"\n{BOLD}{C}{'═'*66}{RST}")
+    print(f"{BOLD}  FINAL SUMMARY  —  {R}{vuln_n} vuln{RST}{BOLD} / {G}{safe_n} safe{RST}{BOLD} / {Y}{unk_n} unknown{RST}"
+          f"{BOLD}  ({elapsed:.0f}s, {CFG.commands_run} cmds){RST}")
+    if interrupted:
+        print(f"  {Y}[!] Interrupted — results are partial.{RST}")
+    print(f"{BOLD}{C}{'═'*66}{RST}")
+    for r in ordered:
         if is_vuln(r["status"]):
             icon = f"{R}🔴{RST}"
         elif is_safe(r["status"]):
@@ -2476,8 +2905,12 @@ def main():
         else:
             icon = f"{Y}🟡{RST}"
         print(f"  {icon}  {r['check']:<45} {BOLD}{r['status']}{RST}")
-    print(f"{BOLD}{C}{'═'*60}{RST}\n")
+    print(f"{BOLD}{C}{'═'*66}{RST}\n")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Y}[!] Aborted by user.{RST}")
+        sys.exit(130)
