@@ -64,6 +64,8 @@ class Config:
     loot_dir      = "/tmp"  # where harvested hashes / temp files are written
     jobs          = 1       # worker threads (1 == old sequential streaming)
     commands_run  = 0       # cheap telemetry for the report
+    current_target = None   # host being assessed right now (nmap/multi-host mode);
+                            # stamped onto each result so the report can group by host
 
 CFG = Config()
 
@@ -185,6 +187,7 @@ def store(check, status, evidence, recommendation=""):
             "status": status,
             "evidence": evidence,
             "recommendation": recommendation,
+            "host": CFG.current_target,   # None in single-target mode
         })
 
 
@@ -2306,6 +2309,10 @@ def generate_report(dc_ip, domain, output_dir, meta=None):
     safe_count    = sum(1 for r in results if is_safe(r["status"]))
     unknown_count = len(results) - vuln_count - safe_count
 
+    # Multi-host (nmap) runs stamp each result with a host; single-target runs don't.
+    multi     = any(r.get("host") for r in results)
+    host_count = len({r.get("host") for r in results if r.get("host")})
+
     # Group by category
     categories = {}
     for r in results:
@@ -2332,28 +2339,49 @@ def generate_report(dc_ip, domain, output_dir, meta=None):
     for r in results:
         cat = CATEGORY_MAP.get(r["check"], "Other")
         rec = f'<td class="rec">{esc(r["recommendation"])}</td>' if r["recommendation"] else "<td></td>"
+        host_cell = f'<td>{esc(r.get("host") or "")}</td>' if multi else ""
         table_rows += (
             f'<tr {row_class(r["status"])}>'
+            f'{host_cell}'
             f'<td>{esc(r["check"])}</td>'
             f'<td><span class="cat">{esc(cat)}</span></td>'
             f'<td>{badge(r["status"])}</td>'
             f'{rec}</tr>\n'
         )
 
-    # Build detailed findings by category
+    def _card(r):
+        cc = card_class(r["status"])
+        rec_html = (f"<p class='rec'><strong>Recommendation:</strong> {esc(r['recommendation'])}</p>"
+                    if r["recommendation"] else "")
+        return (
+            f'<div class="card {cc}"><h4>{esc(r["check"])}</h4>'
+            f'<p>{badge(r["status"])}</p>{rec_html}'
+            f'<details><summary>Evidence</summary>'
+            f'<pre>{esc(r["evidence"])}</pre></details></div>\n'
+        )
+
+    # Build detailed findings. Multi-host: group by host, then category within
+    # each host. Single-target: group by category, exactly as before.
     detail_html = ""
-    for cat, items in categories.items():
-        detail_html += f'<h3 class="ch">{esc(cat)}</h3>\n'
-        for r in items:
-            cc = card_class(r["status"])
-            rec_html = (f"<p class='rec'><strong>Recommendation:</strong> {esc(r['recommendation'])}</p>"
-                        if r["recommendation"] else "")
-            detail_html += (
-                f'<div class="card {cc}"><h4>{esc(r["check"])}</h4>'
-                f'<p>{badge(r["status"])}</p>{rec_html}'
-                f'<details><summary>Evidence</summary>'
-                f'<pre>{esc(r["evidence"])}</pre></details></div>\n'
-            )
+    if multi:
+        by_host = {}
+        for r in results:
+            by_host.setdefault(r.get("host") or "unknown", []).append(r)
+        for host, items in by_host.items():
+            hv = sum(1 for r in items if is_vuln(r["status"]))
+            detail_html += f'<h2 class="hh">🖥 {esc(host)} <span class="hc">{hv} vuln / {len(items)} checks</span></h2>\n'
+            cats = {}
+            for r in items:
+                cats.setdefault(CATEGORY_MAP.get(r["check"], "Other"), []).append(r)
+            for cat, its in cats.items():
+                detail_html += f'<h3 class="ch">{esc(cat)}</h3>\n'
+                for r in its:
+                    detail_html += _card(r)
+    else:
+        for cat, items in categories.items():
+            detail_html += f'<h3 class="ch">{esc(cat)}</h3>\n'
+            for r in items:
+                detail_html += _card(r)
 
     html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/>
 <title>AD Attack Check — {esc(domain)}</title>
@@ -2381,6 +2409,9 @@ tr.vr td{{border-left:3px solid #f85149}}
 .cat{{background:#21262d;color:#8b949e;padding:2px 7px;border-radius:4px;font-size:.76em}}
 .rec{{color:#8b949e;font-size:.81em}}
 .ch{{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:6px;margin-top:28px}}
+.hh{{color:#e6edf3;background:#161b22;border:1px solid #30363d;border-left:3px solid #58a6ff;
+     border-radius:6px;padding:10px 14px;margin-top:34px;font-size:1.1em}}
+.hc{{color:#8b949e;font-size:.7em;font-weight:normal;margin-left:8px}}
 .card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:18px;margin:10px 0}}
 .card h4{{margin:0 0 6px;color:#c9d1d9}}
 .vc{{border-left:3px solid #f85149}}.sc{{border-left:3px solid #3fb950}}.ukc{{border-left:3px solid #d29922}}
@@ -2393,7 +2424,7 @@ footer{{text-align:center;color:#484f58;padding:18px;font-size:.78em;
 </style></head><body>
 <header>
   <h1>🔍 AD Attack Path Check Report</h1>
-  <p><strong>Target DC:</strong> {esc(dc_ip)} &nbsp;|&nbsp;
+  <p><strong>{'Scope:' if multi else 'Target DC:'}</strong> {esc(f'{host_count} hosts (nmap)' if multi else dc_ip)} &nbsp;|&nbsp;
      <strong>Domain:</strong> {esc(domain)} &nbsp;|&nbsp;
      <strong>Generated:</strong> {esc(ts)}</p>
   <p style="color:#8b949e;font-size:.82em;margin-top:6px">
@@ -2413,7 +2444,7 @@ footer{{text-align:center;color:#484f58;padding:18px;font-size:.78em;
     <div class="stat"><div class="num">{len(results)}</div><div class="lbl">Total Checks</div></div>
   </div>
   <h2>Results Overview</h2>
-  <table><thead><tr><th>Check</th><th>Category</th><th>Status</th><th>Recommendation</th></tr></thead>
+  <table><thead><tr>{'<th>Host</th>' if multi else ''}<th>Check</th><th>Category</th><th>Status</th><th>Recommendation</th></tr></thead>
   <tbody>{table_rows}</tbody></table>
   <h2>Detailed Findings</h2>
   {detail_html}
@@ -2442,6 +2473,7 @@ def generate_json(dc_ip, domain, output_dir, meta=None):
         "results": [
             {
                 "check": r["check"],
+                "host": r.get("host"),
                 "category": CATEGORY_MAP.get(r["check"], "Other"),
                 "status": r["status"],
                 "severity": ("vulnerable" if is_vuln(r["status"])
@@ -2754,6 +2786,222 @@ def print_check_table(registry):
           f"(unauth, noisy, privesc, host, quickwin).\n")
 
 
+# ── nmap-driven multi-host mode ───────────────────────────────────────────────
+#
+# Feed the tool an nmap scan of the internal range and it fans the checks out
+# across every live host — port-aware, so a check only fires against a host that
+# actually exposes the relevant service. Hosts that look like domain controllers
+# (Kerberos/LDAP present) get the full AD suite; member hosts get the
+# service / attack-surface checks their open ports warrant. Every finding is
+# stamped with its host so one combined report groups cleanly by machine.
+
+# Which check keys are worth running when a given TCP port is open on a host.
+# These are the "port-gated" checks; everything else is treated as core-AD and
+# only runs against identified DCs (unless the user selects it explicitly).
+PORT_CHECKS = {
+    445:  ["smb", "smbv1", "shares", "spider"],
+    139:  ["smb", "smbv1"],
+    389:  ["ldapsign", "nullbind"],
+    636:  ["ldaps"],
+    88:   ["userenum", "kerberoast", "asrep"],
+    3389: ["rdpnla"],
+    5985: ["winrm"],
+    5986: ["winrm"],
+    1433: ["mssql", "mssqllinked"],
+    161:  ["snmp"],
+    2049: ["nfs"],
+    623:  ["ipmi"],
+    25:   ["smtp"],
+    587:  ["smtp"],
+    6379: ["redis"],
+    9200: ["elastic"],
+    8080: ["jenkins"],
+    8180: ["jenkins"],
+    8443: ["jenkins"],
+}
+
+_DC_PORTS = {88, 464}   # kerberos / kpasswd — a strong DC fingerprint
+
+
+def _gated_keys():
+    """Every check key that is gated behind a specific open port."""
+    return {k for keys in PORT_CHECKS.values() for k in keys}
+
+
+def _key_ports():
+    """Reverse of PORT_CHECKS: check key -> set of ports that justify it."""
+    m = {}
+    for port, keys in PORT_CHECKS.items():
+        for k in keys:
+            m.setdefault(k, set()).add(port)
+    return m
+
+
+def parse_nmap(path):
+    """Parse an nmap file into {ip: {"name": str, "ports": set(int)}}.
+
+    Understands both the normal (-oN, .nmap) and grepable (-oG, .gnmap)
+    formats — whichever the file turns out to be. Only open TCP ports are
+    kept, and only hosts with at least one open port are returned.
+    """
+    text = Path(path).read_text(errors="replace")
+    hosts = {}
+
+    # Grepable format: "Host: 10.0.0.1 (dc01)  ... Ports: 88/open/tcp//kerberos-sec,..."
+    if re.search(r"^Host:\s+\S+.*Ports:", text, re.MULTILINE):
+        for line in text.splitlines():
+            m = re.match(r"Host:\s+(\S+)\s+\(([^)]*)\)", line)
+            if not m:
+                continue
+            ip, name = m.group(1), (m.group(2) or m.group(1))
+            ports = set()
+            pm = re.search(r"Ports:\s*(.+?)(?:\tIgnored|$)", line)
+            if pm:
+                for chunk in pm.group(1).split(","):
+                    f = chunk.strip().split("/")
+                    if len(f) >= 3 and f[1] == "open" and f[2] == "tcp":
+                        try:
+                            ports.add(int(f[0]))
+                        except ValueError:
+                            pass
+            if ports:
+                hosts[ip] = {"name": name, "ports": ports}
+        if hosts:
+            return hosts
+
+    # Normal format: blocks headed by "Nmap scan report for <name> (<ip>)".
+    cur = None
+    for line in text.splitlines():
+        h = re.match(r"Nmap scan report for (.+)", line)
+        if h:
+            tok = h.group(1).strip()
+            m = re.match(r"(\S+)\s+\(([\d.]+)\)", tok)
+            name, ip = (m.group(1), m.group(2)) if m else (tok, tok)
+            cur = ip
+            hosts[ip] = {"name": name, "ports": set()}
+            continue
+        p = re.match(r"(\d+)/tcp\s+open", line)
+        if p and cur:
+            hosts[cur]["ports"].add(int(p.group(1)))
+
+    return {ip: h for ip, h in hosts.items() if h["ports"]}
+
+
+def classify_hosts(hosts, forced_dc=None):
+    """Split parsed hosts into (dcs, members). A host is DC-like if it exposes
+    Kerberos/kpasswd, or the classic LDAP+SMB+DNS trio. forced_dc (from -dc) is
+    always treated as a DC."""
+    dcs, members = [], []
+    for ip, h in hosts.items():
+        p = h["ports"]
+        if (p & _DC_PORTS) or (389 in p and 445 in p and 53 in p):
+            dcs.append(ip)
+        else:
+            members.append(ip)
+    if forced_dc:
+        if forced_dc in members:
+            members.remove(forced_dc)
+        if forced_dc not in dcs:
+            dcs.insert(0, forced_dc)
+            hosts.setdefault(forced_dc, {"name": forced_dc, "ports": set(_DC_PORTS)})
+    return dcs, members
+
+
+def host_check_keys(ip, hosts, is_dc, selected, explicit):
+    """Decide which of the globally-selected check keys to run against one host.
+
+    explicit (user passed --only/--tags): run the full selected set on every
+    host — per-check check_port() still guards service checks. Otherwise:
+    port-gated checks run where their port is open; non-gated core-AD checks
+    run only on DCs.
+    """
+    ports = hosts.get(ip, {}).get("ports", set())
+    gated, kp = _gated_keys(), _key_ports()
+    keys = []
+    for k in selected:
+        if explicit:
+            keys.append(k)
+        elif k in gated:
+            if ports & kp.get(k, set()):
+                keys.append(k)
+        elif is_dc:
+            keys.append(k)
+    return keys
+
+
+def run_nmap_mode(args, no_creds, username, pw, nh, selected_keys, explicit_select):
+    """Orchestrate a port-aware sweep across every host in an nmap file."""
+    section("nmap-driven network sweep")
+    try:
+        hosts = parse_nmap(args.nmap)
+    except FileNotFoundError:
+        log(f"nmap file not found: {args.nmap}", "bad")
+        sys.exit(1)
+    if not hosts:
+        log("No live hosts with open ports parsed from the nmap file.", "bad")
+        sys.exit(1)
+
+    dcs, members = classify_hosts(hosts, forced_dc=(args.dc_ip or None))
+    log(f"Parsed {len(hosts)} host(s): {len(dcs)} DC-like, {len(members)} member(s).", "good")
+    if dcs:
+        log("DC-like: " + ", ".join(dcs), "info")
+
+    # One preflight against a representative target (a DC if we have one).
+    pf_target = (args.dc_ip or (dcs[0] if dcs else None)
+                 or next((ip for ip in hosts if 445 in hosts[ip]["ports"]), None)
+                 or next(iter(hosts)))
+    pf_ctx = Ctx(pf_target, username, pw, args.domain or "", args.subnet, nh)
+    if not preflight(pf_ctx, args.force, no_creds):
+        sys.exit(2)
+    domain = pf_ctx.domain            # may have been auto-discovered in no_creds
+
+    order = [(ip, True) for ip in dcs] + [(ip, False) for ip in members]
+    start, interrupted = time.time(), False
+    try:
+        for ip, is_dc in order:
+            keys = host_check_keys(ip, hosts, is_dc, selected_keys, explicit_select)
+            if not keys:
+                continue
+            CFG.current_target = ip
+            reg = build_registry(Ctx(ip, username, pw, domain, args.subnet, nh))
+            checks = select_checks(reg, keys, [], [], [])
+            name = hosts.get(ip, {}).get("name", ip)
+            label = f"[{'DC' if is_dc else 'host'}] {ip}"
+            if name and name != ip:
+                label += f" ({name})"
+            section(f"{label} — {len(checks)} checks")
+            run_checks(checks, CFG.jobs)
+    except KeyboardInterrupt:
+        interrupted = True
+        log("Interrupted — writing partial combined report...", "warn")
+    finally:
+        CFG.current_target = None
+    elapsed = time.time() - start
+
+    meta = {
+        "mode": "nmap", "nmap_file": args.nmap,
+        "hosts_total": len(hosts), "dcs": len(dcs), "members": len(members),
+        "dc_ip": pf_target, "domain": domain,
+        "auth": "none" if no_creds else ("pth" if nh else "password"),
+        "subnet": args.subnet, "checks_selected": len(results),
+        "commands_run": CFG.commands_run, "elapsed_seconds": round(elapsed, 1),
+        "jobs": CFG.jobs, "interrupted": interrupted,
+        "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    section("Generating Report")
+    html = generate_report(pf_target, domain, args.output, meta)
+    log(f"HTML report : {html}", "good")
+    if args.json:
+        js = generate_json(pf_target, domain, args.output, meta)
+        log(f"JSON report : {js}", "good")
+
+    v = sum(1 for r in results if is_vuln(r["status"]))
+    sfe = sum(1 for r in results if is_safe(r["status"]))
+    hosts_hit = len({r.get("host") for r in results if r.get("host")})
+    log(f"Done. {len(results)} findings across {hosts_hit} host(s) "
+        f"({v} vuln / {sfe} safe) in {elapsed:.1f}s.", "warn" if v else "good")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -2790,6 +3038,10 @@ def main():
                    help="Credential-less pass (null session). Runs the 'unauth' check set only, "
                         "unless you also pass --only/--tags. -u/-d optional; domain auto-detected "
                         "from the DC banner when omitted.")
+    p.add_argument("--nmap", default=None, metavar="FILE",
+                   help="Fan the checks across every host in an nmap file (.nmap or .gnmap). "
+                        "Port-aware: DC-like hosts get the AD suite, member hosts get the "
+                        "service/attack-surface checks their open ports warrant. -dc optional.")
     args = p.parse_args()
 
     # --list-checks needs no target/creds.
@@ -2805,9 +3057,14 @@ def main():
     # -u and -d become optional (domain is auto-detected from the SMB banner).
     no_creds = args.no_creds or (not args.username and not pw and not nh)
 
-    # Required-when-running args (kept out of argparse 'required' so --list-checks works alone)
-    required = (("-dc", args.dc_ip),) if no_creds \
-        else (("-dc", args.dc_ip), ("-u", args.username), ("-d", args.domain))
+    # Required-when-running args (kept out of argparse 'required' so --list-checks works alone).
+    # --nmap supplies targets from the file, so -dc is optional there.
+    if args.nmap:
+        required = () if no_creds else (("-u", args.username), ("-d", args.domain))
+    elif no_creds:
+        required = (("-dc", args.dc_ip),)
+    else:
+        required = (("-dc", args.dc_ip), ("-u", args.username), ("-d", args.domain))
     missing = [f for f, v in required if not v]
     if missing:
         print(f"\n{R}[!] ERROR: missing required argument(s): {', '.join(missing)}{RST}\n")
@@ -2827,6 +3084,21 @@ def main():
     CFG.timeout_scale = args.timeout_scale
     CFG.jobs          = max(1, args.jobs)
     CFG.loot_dir      = args.output           # keep harvested loot next to the report
+
+    # Resolve the selected check set once — shared by single-target and nmap modes.
+    eff_tags = args.tags
+    if no_creds and not args.only and not args.tags:
+        eff_tags = ["unauth"]
+    explicit_select = bool(args.only or args.tags)
+    selected_keys = [c.key for c in select_checks(
+        build_registry(Ctx(args.dc_ip or "", username, pw, args.domain or "", args.subnet, nh)),
+        args.only, [s.lower() for s in args.skip], eff_tags, [t.lower() for t in args.skip_tags])]
+
+    # ── nmap multi-host mode: fan the selected checks across the network ───────
+    if args.nmap:
+        log(f"Workers   : {CFG.jobs}", "info")
+        run_nmap_mode(args, no_creds, username, pw, nh, selected_keys, explicit_select)
+        return
 
     ctx = Ctx(args.dc_ip, username, pw, args.domain or "", args.subnet, nh)
 
