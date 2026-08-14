@@ -21,6 +21,7 @@ Built to be plonk-and-go: point it at a DC and it runs a preflight, executes onl
 - **Concurrent execution** — checks run in a thread pool (`-j`, default 10), typically 5–10× faster than sequential. `-j 1` restores live sequential output
 - **No-credential / null-session mode** (`--no-creds`) for the pre-access phase — auto-detects the domain from the DC banner and runs only the checks that work without creds
 - **Tag-based selection** — run subsets by behaviour (`--tags` / `--skip-tags`), pick specific checks (`--only`), or list them all (`--list-checks`)
+- **Network sweep from an nmap scan** (`--nmap`) — fan the checks across every host in an internal range, port-aware, with a per-host combined report
 - **Preflight** — inventories tooling and validates credentials once, so a bad login or missing NetExec fails fast instead of 80+ times
 - **Pass-the-Hash** (`-H`) across all NetExec, impacket, and certipy calls
 - **Machine-readable JSON report** (`--json`) alongside the HTML, for diffing between runs and feeding pipelines
@@ -110,6 +111,7 @@ python3 AD_Attack_Checker.py -dc 10.0.0.1 -u 'john.smith' -p 'Password123!' \
 | `-s` | ❌ | Subnet for host-wide checks | `-s 10.0.0.0/24` |
 | `-o` | ❌ | Output directory (default: `./loot`) | `-o ./loot` |
 | `--no-creds` | ❌ | Credential-less null-session pass (see below) | |
+| `--nmap` | ❌ | Fan checks across every host in an nmap file (`.nmap`/`.gnmap`) | `--nmap scan.gnmap` |
 | `-j`, `--jobs` | ❌ | Parallel worker threads (default 10; `1` = sequential) | `-j 12` |
 | `--only` | ❌ | Run ONLY these check keys | `--only smb adcs` |
 | `--tags` | ❌ | Run only checks carrying any of these tags | `--tags quickwin` |
@@ -124,7 +126,8 @@ python3 AD_Attack_Checker.py -dc 10.0.0.1 -u 'john.smith' -p 'Password123!' \
 
 > ¹ `-u`, `-p`/`-H` and `-d` are required for an authenticated run. In `--no-creds`
 > mode only `-dc` is required — username defaults to a null session and the domain
-> is auto-detected from the DC banner.
+> is auto-detected from the DC banner. With `--nmap`, `-dc` is optional (targets come
+> from the scan file).
 
 ---
 
@@ -150,6 +153,50 @@ foothold, re-run with `-u user -p pass` for the full 83.
 > On a hardened DC with `RestrictAnonymous` set, the null session is refused and the
 > LDAP/SAMR-based checks come back blank — the banner-based and network/service checks
 > carry that pass. Preflight tells you which situation you're in.
+
+---
+
+## Network sweep from an nmap scan (`--nmap`)
+
+Point the tool at an nmap file and it runs the checks across the **whole internal
+range** instead of a single DC — port-aware, so a check only fires against a host
+that actually exposes the relevant service.
+
+```bash
+# Scan the range, then sweep it
+nmap -p- -oA internal 10.0.0.0/24
+python3 AD_Attack_Checker.py --nmap internal.gnmap -u user -p 'Pass!' -d corp.local --json
+
+# No creds yet? Null-session sweep across the whole range
+python3 AD_Attack_Checker.py --nmap internal.nmap --no-creds
+```
+
+How it works:
+
+- Parses the scan into hosts and open ports — both the normal (`-oN`, `.nmap`) and
+  grepable (`-oG`, `.gnmap`) formats are understood.
+- **Classifies each host.** DC-like hosts (Kerberos/kpasswd, or the LDAP + SMB + DNS
+  trio) get the full AD suite. Member hosts get only the checks their open ports
+  warrant — e.g. `445` → SMB signing / SMBv1 / shares, `3389` → RDP NLA, `1433` →
+  MSSQL, `6379` → Redis, `161` → SNMP, `2049` → NFS, `623` → IPMI.
+- Runs **one preflight** against a representative DC. `-dc` is optional here (targets
+  come from the file), but supplying it forces a known DC into the DC list.
+- **Stamps every finding with its host.** The combined HTML report gains a `Host`
+  column and groups detailed findings per machine; the JSON carries a `host` field
+  on each result.
+
+Composition:
+
+- `--no-creds --nmap` → null-session sweep: signing / SMBv1 / RDP and exposed
+  services across every host, plus Zerologon and MS17-010 against the DCs.
+- `--only` / `--tags` override the port gating and run your chosen checks on every
+  host (per-check port probes still self-skip where irrelevant). By default the
+  heavier host-loot checks (DPAPI, KeePass, Veeam, …) run only against DCs — opt
+  into them network-wide with `--tags host` or an explicit `--only`.
+
+> Hosts are assessed one at a time; checks within each host run in the `-j` pool.
+> On a large range this is slower than a single-host run but keeps the per-host
+> report clean and avoids hammering the whole network at once.
 
 ---
 
